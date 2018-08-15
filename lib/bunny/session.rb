@@ -1287,7 +1287,7 @@ module Bunny
         @transport = Transport.new(self,
                                    host_from_address(address),
                                    port_from_address(address),
-                                   @opts.merge(:session_thread => @origin_thread)
+                                   @opts
                                   )
 
         # Reset the cached progname for the logger only when no logger was provided

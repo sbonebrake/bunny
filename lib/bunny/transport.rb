@@ -36,7 +36,6 @@ module Bunny
 
     def initialize(session, host, port, opts)
       @session        = session
-      @session_thread = opts[:session_thread]
       @host    = host
       @port    = port
       @opts    = opts
@@ -126,7 +125,7 @@ module Bunny
           if @session.automatically_recover?
             @session.handle_network_failure(e)
           else
-            @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
+            raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
           end
         end
       end
@@ -150,25 +149,27 @@ module Bunny
           if @session.automatically_recover?
             @session.handle_network_failure(e)
           else
-            @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
+            raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
           end
         end
       end
     end
 
     # Writes data to the socket without timeout checks
-    def write_without_timeout(data, raise_exceptions = false)
+    def write_without_timeout(data)
       begin
-        @writes_mutex.synchronize { @socket.write(data) }
-        @socket.flush
+        if open?
+          @writes_mutex.synchronize { @socket.write(data) }
+          @socket.flush
+        end
       rescue SystemCallError, Bunny::ConnectionError, IOError => e
         close
-        raise e if raise_exceptions
+        @status = :not_connected
 
         if @session.automatically_recover?
           @session.handle_network_failure(e)
         else
-          @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
+          raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
         end
       end
     end
@@ -225,7 +226,7 @@ module Bunny
         if @session.automatically_recover?
           raise
         else
-          @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
+          raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
         end
       end
     end
