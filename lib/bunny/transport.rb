@@ -25,7 +25,7 @@ module Bunny
     DEFAULT_READ_TIMEOUT  = 30.0
     DEFAULT_WRITE_TIMEOUT = 30.0
 
-    attr_reader :session, :host, :port, :socket, :connect_timeout, :read_timeout, :write_timeout, :disconnect_timeout
+    attr_reader :host, :port, :socket, :connect_timeout, :read_timeout, :write_timeout, :disconnect_timeout
     attr_reader :tls_context, :verify_peer, :tls_ca_certificates, :tls_certificate_path, :tls_key_path
 
     attr_writer :read_timeout
@@ -34,14 +34,12 @@ module Bunny
       @read_timeout = nil if @read_timeout == 0
     end
 
-    def initialize(session, host, port, opts)
-      @session        = session
-      @session_thread = opts[:session_thread]
+    def initialize(host, port, logger, mutex_impl, opts)
       @host    = host
       @port    = port
       @opts    = opts
 
-      @logger                = session.logger
+      @logger                = logger
       @tls_enabled           = tls_enabled?(opts)
 
       @read_timeout = opts[:read_timeout] || DEFAULT_READ_TIMEOUT
@@ -56,7 +54,7 @@ module Bunny
       @connect_timeout    = nil if @connect_timeout == 0
       @disconnect_timeout = @write_timeout || @read_timeout || @connect_timeout
 
-      @writes_mutex       = @session.mutex_impl.new
+      @writes_mutex       = mutex_impl.new
 
       prepare_tls_context(opts) if @tls_enabled
     end
@@ -110,66 +108,59 @@ module Bunny
     if defined?(JRUBY_VERSION)
       # Writes data to the socket.
       def write(data)
-        return write_without_timeout(data) unless @write_timeout
 
         begin
+          return write_without_timeout(data) unless @write_timeout
           if open?
             @writes_mutex.synchronize do
               @socket.write(data)
             end
+          else
+            raise ConnectionClosedError.new
           end
-        rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
+        rescue SystemCallError, Timeout::Error, IOError => e
           @logger.error "Got an exception when sending data: #{e.message} (#{e.class.name})"
           close
           @status = :not_connected
-
-          if @session.automatically_recover?
-            @session.handle_network_failure(e)
-          else
-            @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
-          end
+          raise
         end
       end
     else
       # Writes data to the socket. If read/write timeout was specified the operation will return after that
       # amount of time has elapsed waiting for the socket.
       def write(data)
-        return write_without_timeout(data) unless @write_timeout
 
         begin
+          return write_without_timeout(data) unless @write_timeout
           if open?
             @writes_mutex.synchronize do
               @socket.write_nonblock_fully(data, @write_timeout)
             end
+          else
+            raise ConnectionClosedError.new
           end
-        rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
+        rescue SystemCallError, Timeout::Error, IOError => e
           @logger.error "Got an exception when sending data: #{e.message} (#{e.class.name})"
           close
           @status = :not_connected
-
-          if @session.automatically_recover?
-            @session.handle_network_failure(e)
-          else
-            @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
-          end
+          raise
         end
       end
     end
 
     # Writes data to the socket without timeout checks
-    def write_without_timeout(data, raise_exceptions = false)
+    def write_without_timeout(data, raise_exceptions)
       begin
-        @writes_mutex.synchronize { @socket.write(data) }
-        @socket.flush
-      rescue SystemCallError, Bunny::ConnectionError, IOError => e
-        close
-        raise e if raise_exceptions
-
-        if @session.automatically_recover?
-          @session.handle_network_failure(e)
+        if open?
+          @writes_mutex.synchronize { @socket.write(data) }
+          @socket.flush
         else
-          @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
+          raise ConnectionClosedError.new
         end
+      rescue SystemCallError, IOError => e
+        close
+        @status = :not_connected
+        raise
       end
     end
 
@@ -179,7 +170,7 @@ module Bunny
     # @private
     def send_frame(frame)
       if closed?
-        @session.handle_network_failure(ConnectionClosedError.new(frame))
+        raise ConnectionClosedError.new(frame)
       else
         write(frame.encode)
       end
@@ -191,7 +182,7 @@ module Bunny
     # @private
     def send_frame_without_timeout(frame)
       if closed?
-        @session.handle_network_failure(ConnectionClosedError.new(frame))
+        raise ConnectionClosedError.new(frame)
       else
         write_without_timeout(frame.encode)
       end
@@ -216,17 +207,17 @@ module Bunny
 
     def read_fully(count)
       begin
-        @socket.read_fully(count, @read_timeout)
+        if open?
+          @socket.read_fully(count, @read_timeout)
+        else
+          raise ConnectionClosedError.new
+        end
       rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
         @logger.error "Got an exception when receiving data: #{e.message} (#{e.class.name})"
         close
         @status = :not_connected
 
-        if @session.automatically_recover?
-          raise
-        else
-          @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
-        end
+        raise Bunny::NetworkFailure.new("detected a network failure in read_fully: #{e.message}", e)
       end
     end
 

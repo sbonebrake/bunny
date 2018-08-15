@@ -33,13 +33,13 @@ module Bunny
         begin
           break if @mutex.synchronize { @stopping || @stopped || @network_is_down }
           run_once
-        rescue AMQ::Protocol::EmptyResponseError, IOError, SystemCallError, Timeout::Error => e
+        rescue AMQ::Protocol::EmptyResponseError, IOError, SystemCallError, Timeout::Error, ConnectionClosedError => e
           break if terminate? || @session.closing? || @session.closed?
 
           @network_is_down = true
           if @session.automatically_recover?
             log_exception(e, level: :warn)
-            @session.handle_network_failure(e)
+            @session.handle_network_failure(e) #TODO: signal automatic recover
           else
             log_exception(e)
             @session_thread.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))

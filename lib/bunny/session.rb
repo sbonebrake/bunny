@@ -202,7 +202,6 @@ module Bunny
       @channel_mutex       = @mutex_impl.new
       # transport operations/continuations mutex. A workaround for
       # the non-reentrant Ruby mutexes. MK.
-      @transport_mutex     = @mutex_impl.new
       @status_mutex        = @mutex_impl.new
       @address_index_mutex = @mutex_impl.new
 
@@ -523,9 +522,8 @@ module Bunny
         n = ch.number
         self.register_channel(ch)
 
-        @transport_mutex.synchronize do
-          @transport.send_frame(AMQ::Protocol::Channel::Open.encode(n, AMQ::Protocol::EMPTY_STRING))
-        end
+        self.send_frame(AMQ::Protocol::Channel::Open.encode(n, AMQ::Protocol::EMPTY_STRING))
+
         @last_channel_open_ok = wait_on_continuations
         raise_if_continuation_resulted_in_a_connection_error!
 
@@ -538,7 +536,7 @@ module Bunny
       @channel_mutex.synchronize do
         n = ch.number
 
-        @transport.send_frame(AMQ::Protocol::Channel::Close.encode(n, 200, "Goodbye", 0, 0))
+        self.send_frame(AMQ::Protocol::Channel::Close.encode(n, 200, "Goodbye", 0, 0))
         @last_channel_close_ok = wait_on_continuations
         raise_if_continuation_resulted_in_a_connection_error!
 
@@ -570,7 +568,8 @@ module Bunny
     # @private
     def close_connection(sync = true)
       if @transport.open?
-        @transport.send_frame(AMQ::Protocol::Connection::Close.encode(200, "Goodbye", 0, 0))
+
+        @transport.send_frame(AMQ::Protocol::Connection::Close.encode(200, "Goodbye", 0, 0)) rescue ConnectionClosedError
 
         if sync
           @last_connection_close_ok = wait_on_continuations
@@ -598,10 +597,11 @@ module Bunny
       when AMQ::Protocol::Channel::CloseOk then
         @continuations.push(method)
       when AMQ::Protocol::Connection::Close then
+        @status_mutex.synchronize { @status = :disconnected }
         if recover_from_connection_close?
           @logger.warn "Recovering from connection.close (#{method.reply_text})"
           clean_up_on_shutdown
-          handle_network_failure(instantiate_connection_level_exception(method))
+          raise instantiate_connection_level_exception(method)
         else
           clean_up_and_fail_on_connection_close!(method)
         end
@@ -674,8 +674,6 @@ module Bunny
     # @private
     def handle_network_failure(exception)
       raise NetworkErrorWrapper.new(exception) unless @threaded
-
-      @status_mutex.synchronize { @status = :disconnected }
 
       if !recovering_from_network_failure?
         begin
@@ -1032,6 +1030,19 @@ module Bunny
       @heartbeat_sender.signal_activity! if @heartbeat_sender
     end
 
+    # @private
+    def safe_transport
+      begin
+        if open?
+          yield(@transport)
+        else
+          raise ConnectionClosedError.new()
+        end
+      rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
+        @status_mutex.synchronize { @status = :disconnected }
+        raise e
+      end
+    end
 
     # Sends frame to the peer, checking that connection is open.
     # Exposed primarily for Bunny::Channel
@@ -1039,30 +1050,10 @@ module Bunny
     # @raise [ConnectionClosedError]
     # @private
     def send_frame(frame, signal_activity = true)
-      if open?
-        # @transport_mutex.synchronize do
-        #   @transport.write(frame.encode)
-        # end
-        @transport.write(frame.encode)
-        signal_activity! if signal_activity
-      else
-        raise ConnectionClosedError.new(frame)
+      safe_transport do |transport|
+        transport.write(frame.encode)
       end
-    end
-
-    # Sends frame to the peer, checking that connection is open.
-    # Uses transport implementation that does not perform
-    # timeout control. Exposed primarily for Bunny::Channel.
-    #
-    # @raise [ConnectionClosedError]
-    # @private
-    def send_frame_without_timeout(frame, signal_activity = true)
-      if open?
-        @transport.write_without_timeout(frame.encode)
-        signal_activity! if signal_activity
-      else
-        raise ConnectionClosedError.new(frame)
-      end
+      signal_activity! if signal_activity
     end
 
     # Sends multiple frames, in one go. For thread safety this method takes a channel
@@ -1080,40 +1071,12 @@ module Bunny
       channel.synchronize do
         # see rabbitmq/rabbitmq-server#156
         data = frames.reduce("") { |acc, frame| acc << frame.encode }
-        @transport.write(data)
+        safe_transport do |transport|
+          transport.write(data)
+        end
         signal_activity!
       end
     end # send_frameset(frames)
-
-    # Sends multiple frames, one by one. For thread safety this method takes a channel
-    # object and synchronizes on it. Uses transport implementation that does not perform
-    # timeout control.
-    #
-    # @private
-    def send_frameset_without_timeout(frames, channel)
-      # some developers end up sharing channels between threads and when multiple
-      # threads publish on the same channel aggressively, at some point frames will be
-      # delivered out of order and broker will raise 505 UNEXPECTED_FRAME exception.
-      # If we synchronize on the channel, however, this is both thread safe and pretty fine-grained
-      # locking. See a note about "single frame" methods in a comment in `send_frameset`. MK.
-      channel.synchronize do
-        frames.each { |frame| self.send_frame_without_timeout(frame, false) }
-        signal_activity!
-      end
-    end # send_frameset_without_timeout(frames)
-
-    # @private
-    def send_raw_without_timeout(data, channel)
-      # some developers end up sharing channels between threads and when multiple
-      # threads publish on the same channel aggressively, at some point frames will be
-      # delivered out of order and broker will raise 505 UNEXPECTED_FRAME exception.
-      # If we synchronize on the channel, however, this is both thread safe and pretty fine-grained
-      # locking. Note that "single frame" methods do not need this kind of synchronization. MK.
-      channel.synchronize do
-        @transport.write(data)
-        signal_activity!
-      end
-    end # send_frameset_without_timeout(frames)
 
     # @return [String]
     # @api public
@@ -1284,9 +1247,10 @@ module Bunny
       if address = @addresses[ @address_index ]
         @address_index_mutex.synchronize { @address_index += 1 }
         @transport.close rescue nil # Let's make sure the previous transport socket is closed
-        @transport = Transport.new(self,
-                                   host_from_address(address),
+        @transport = Transport.new(host_from_address(address),
                                    port_from_address(address),
+                                   logger,
+                                   mutex_impl,
                                    @opts.merge(:session_thread => @origin_thread)
                                   )
 
@@ -1307,7 +1271,9 @@ module Bunny
     # Sends AMQ protocol header (also known as preamble).
     # @private
     def send_preamble
-      @transport.write(AMQ::Protocol::PREAMBLE)
+      safe_transport do |transport|
+        transport.write(AMQ::Protocol::PREAMBLE)
+      end
       @logger.debug "Sent protocol preamble"
     end
 

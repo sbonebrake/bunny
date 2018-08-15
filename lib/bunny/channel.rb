@@ -1878,11 +1878,6 @@ module Bunny
     end
 
     # @private
-    def read_next_frame(options = {})
-      @connection.read_next_frame(options = {})
-    end
-
-    # @private
     def deregister_queue(queue)
       @queue_mutex.synchronize { @queues.delete(queue.name) }
     end
